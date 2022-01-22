@@ -1,0 +1,10 @@
+.idea/
+.vscode/
+/worker
+.DS_Store
+
+.terraform.lock.hcl
+.terraform/
+*.tfstate
+*.tfstate.backup
+*.tfvars.json
