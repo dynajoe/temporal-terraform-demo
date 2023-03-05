@@ -6,10 +6,11 @@ import (
 
 func Register(w worker.Worker) {
 	w.RegisterWorkflow(CreateDemoNetworkWorkflow)
-	w.RegisterActivity(CreateVPCActivity)
-	w.RegisterActivity(CreateSubnetsActivity)
+	w.RegisterWorkflow(CreateVPCWorkflow)
+	w.RegisterWorkflow(CreateSubnetsWorkflow)
 
-	w.RegisterWorkflow(DestroyDemoNetworkWorkflow)
-	w.RegisterActivity(DestroyVPCActivity)
-	w.RegisterActivity(DestroySubnetsActivity)
+	w.RegisterWorkflow(TerraformPlanAndApplyWorkflow)
+	w.RegisterActivity(TerraformPlanActivity)
+	w.RegisterActivity(TerraformApplyActivity)
+	w.RegisterActivity(TerraformBundleEmbeddedTerraformActivity)
 }

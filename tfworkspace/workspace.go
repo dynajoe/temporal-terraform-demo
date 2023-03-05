@@ -1,109 +1,142 @@
 package tfworkspace
 
 import (
+	"archive/zip"
 	"context"
-	"embed"
 	"fmt"
-	"io/ioutil"
-	"log"
+	"io"
 	"os"
 	"path"
+	"path/filepath"
+	"syscall"
 
-	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/dynajoe/temporal-terraform-demo/tfexec"
 )
 
 type (
-	Config struct {
-		TerraformPath string
-		TerraformFS   embed.FS
-		S3Backend     tfexec.S3BackendConfig
+	PlanOutput struct {
+		PlanFile   string
+		HasChanges bool
+		Summary    string
 	}
 
 	ApplyInput struct {
-		Env            map[string]string
-		Vars           map[string]interface{}
-		AttemptImport  map[string]string
-		AwsCredentials aws.CredentialsProvider
+		Env  map[string]string
+		Vars map[string]any
 	}
 
 	ApplyOutput struct {
-		Output map[string]interface{}
+		Output map[string]any
 	}
 
 	DestroyInput struct {
-		Env            map[string]string
-		Vars           map[string]interface{}
-		AwsCredentials aws.CredentialsProvider
+		Env  map[string]string
+		Vars map[string]any
 	}
 
 	Workspace struct {
-		config Config
-		tf     tfexec.NewTerraformFunc
+		bundlePath string
+		tf         tfexec.NewTerraformFunc
 	}
 )
 
-func New(config Config) *Workspace {
-	return &Workspace{config: config, tf: tfexec.LazyFromPath()}
+func NewFromBundle(bundlePath string) *Workspace {
+	return &Workspace{bundlePath: bundlePath, tf: tfexec.LazyFromPath()}
 }
 
-func (w *Workspace) Apply(ctx context.Context, input ApplyInput) (ApplyOutput, error) {
+func (w *Workspace) init(ctx context.Context) (tf *tfexec.Terraform, cleanup func(), retErr error) {
 	// Create temporary workspace
-	workDir, err := ioutil.TempDir("", "tf-apply-")
+	workDir, err := os.MkdirTemp("", "tf-")
 	if err != nil {
-		return ApplyOutput{}, fmt.Errorf("error creating terraform workspace: %w", err)
+		return nil, nil, fmt.Errorf("error creating terraform directory: %w", err)
 	}
-	defer os.RemoveAll(workDir)
+	defer func() {
+		if retErr != nil {
+			_ = os.RemoveAll(workDir)
+		}
+	}()
 
-	// Extract embedded terraform to the workspace
-	if err = extractEmbeddedTerraform(w.config.TerraformFS, w.config.TerraformPath, workDir); err != nil {
-		return ApplyOutput{}, fmt.Errorf("error extracting terraform: %w", err)
+	// Unzip the contents of terraform bundle
+	if _, err := unzip(w.bundlePath, workDir); err != nil {
+		return nil, nil, err
 	}
 
-	log.Printf("initializing terraform in directory: %s", workDir)
+	// Get terraform executable interface
+	tf, err = w.tf(workDir)
+	if err != nil {
+		return nil, nil, err
+	}
 
-	// Initialize terraform workspace
-	tf, err := w.init(ctx, workDir)
+	// terraform init
+	if err := tf.Init(ctx, tfexec.InitParams{}); err != nil {
+		return nil, nil, err
+	}
+
+	return tf, func() {
+		_ = os.RemoveAll(workDir)
+	}, nil
+}
+
+func (w *Workspace) Plan(ctx context.Context, env map[string]string) (PlanOutput, error) {
+	// Init workspace
+	tf, cleanup, err := w.init(ctx)
+	if err != nil {
+		return PlanOutput{}, err
+	}
+	defer cleanup()
+
+	// Temporary file to write plan
+	planFile, err := os.CreateTemp("", "terraform.*.tf-plan")
+	if err != nil {
+		return PlanOutput{}, err
+	}
+
+	// Terraform plan
+	hasChanges, err := tf.Plan(ctx, tfexec.PlanParams{
+		Env:      env,
+		PlanFile: planFile.Name(),
+		VarsFile: path.Join(tf.WorkDir(), "terraform.tfvars.json"),
+	})
+	if err != nil {
+		return PlanOutput{}, fmt.Errorf("terraform plan error: %w", err)
+	}
+
+	return PlanOutput{
+		PlanFile:   planFile.Name(),
+		HasChanges: hasChanges,
+	}, nil
+}
+
+func (w *Workspace) Destroy(ctx context.Context, env map[string]string, planFile string) error {
+	// Init workspace
+	tf, cleanup, err := w.init(ctx)
+	if err != nil {
+		return err
+	}
+	defer cleanup()
+
+	if err := tf.Destroy(ctx, tfexec.DestroyParams{
+		PlanFile: planFile,
+		Env:      env,
+	}); err != nil {
+		return fmt.Errorf("terraform destroy error: %w", err)
+	}
+
+	return nil
+}
+
+func (w *Workspace) Apply(ctx context.Context, env map[string]string, planFile string) (ApplyOutput, error) {
+	// Init workspace
+	tf, cleanup, err := w.init(ctx)
 	if err != nil {
 		return ApplyOutput{}, err
 	}
+	defer cleanup()
 
-	// Copy env to a new map
-	env := make(map[string]string, len(input.Env))
-	for k, v := range input.Env {
-		env[k] = v
-	}
-
-	// Add AWS creds to environment
-	if input.AwsCredentials != nil {
-		creds, err := input.AwsCredentials.Retrieve(ctx)
-		if err != nil {
-			return ApplyOutput{}, err
-		}
-		env["AWS_ACCESS_KEY_ID"] = creds.AccessKeyID
-		env["AWS_SECRET_ACCESS_KEY"] = creds.SecretAccessKey
-		env["AWS_SESSION_TOKEN"] = creds.SessionToken
-	}
-
-	// Attempt to import resources that may have not had state pushed on failure
-	for k, v := range input.AttemptImport {
-		// Intentionally ignoring error
-		_ = tf.Import(ctx, tfexec.ImportParams{
-			Env:     env,
-			Vars:    input.Vars,
-			Address: k,
-			ID:      v,
-		})
-
-		// Check for context cancel
-		if ctx.Err() != nil {
-			return ApplyOutput{}, ctx.Err()
-		}
-	}
-
+	// Terraform apply plan-file
 	if err := tf.Apply(ctx, tfexec.ApplyParams{
-		Vars: input.Vars,
-		Env:  env,
+		PlanFile: planFile,
+		Env:      env,
 	}); err != nil {
 		return ApplyOutput{}, fmt.Errorf("terraform apply error: %w", err)
 	}
@@ -126,77 +159,6 @@ func (w *Workspace) Apply(ctx context.Context, input ApplyInput) (ApplyOutput, e
 	}, nil
 }
 
-func (w *Workspace) Destroy(ctx context.Context, input DestroyInput) error {
-	// Create temporary workspace
-	workDir, err := ioutil.TempDir("", "tf-destroy-")
-	if err != nil {
-		return fmt.Errorf("error creating terraform workspace: %w", err)
-	}
-	defer os.RemoveAll(workDir)
-
-	// Only extract versions.tf for destroy because it's needed to determine
-	// the versions of terraform providers. Every terraform directory should
-	// have a versions.tf at the top level.
-	versionsFileData, err := w.config.TerraformFS.ReadFile(path.Join(w.config.TerraformPath, "versions.tf"))
-	if err != nil {
-		return err
-	}
-
-	// Write the contents of the versions file to the workspace
-	if err := os.WriteFile(path.Join(workDir, "versions.tf"), versionsFileData, 0644); err != nil {
-		return err
-	}
-
-	// Initialize terraform workspace
-	tf, err := w.init(ctx, workDir)
-	if err != nil {
-		return err
-	}
-
-	// Copy env to a new map
-	env := make(map[string]string, len(input.Env))
-	for k, v := range input.Env {
-		env[k] = v
-	}
-
-	// Add AWS creds to environment
-	if input.AwsCredentials != nil {
-		creds, err := input.AwsCredentials.Retrieve(ctx)
-		if err != nil {
-			return err
-		}
-		env["AWS_ACCESS_KEY_ID"] = creds.AccessKeyID
-		env["AWS_SECRET_ACCESS_KEY"] = creds.SecretAccessKey
-		env["AWS_SESSION_TOKEN"] = creds.SessionToken
-	}
-
-	if err := tf.Destroy(ctx, tfexec.DestroyParams{
-		Vars: input.Vars,
-		Env:  env,
-	}); err != nil {
-		return fmt.Errorf("terraform destroy error: %w", err)
-	}
-
-	return nil
-}
-
-func (w *Workspace) init(ctx context.Context, workDir string) (*tfexec.Terraform, error) {
-	tf, err := w.tf(workDir)
-	if err != nil {
-		return nil, err
-	}
-
-	initParams := tfexec.InitParams{
-		Backend: w.config.S3Backend,
-	}
-	err = tf.Init(ctx, initParams)
-	if err != nil {
-		return nil, err
-	}
-
-	return tf, nil
-}
-
 func (o ApplyOutput) String(key string) (string, error) {
 	v, ok := o.Output[key]
 	if !ok {
@@ -209,4 +171,69 @@ func (o ApplyOutput) String(key string) (string, error) {
 	}
 
 	return s, nil
+}
+
+func unzip(src, dest string) ([]string, error) {
+	if err := os.MkdirAll(dest, os.ModePerm); err != nil {
+		return nil, err
+	}
+
+	r, err := zip.OpenReader(src)
+	if err != nil {
+		return nil, err
+	}
+	defer r.Close()
+
+	// Extract files and make dirs
+	var extracted []string
+	for _, f := range r.File {
+		extracted = append(extracted, f.Name)
+		if f.FileInfo().IsDir() {
+			if err := os.MkdirAll(filepath.Join(dest, f.Name), os.ModePerm); err != nil {
+				return nil, err
+			}
+			continue
+		}
+
+		if err := extractFile(f, dest); err != nil {
+			return nil, err
+		}
+	}
+
+	return extracted, nil
+}
+
+func extractFile(zfile *zip.File, destDir string) (err error) {
+	fpath := filepath.Join(destDir, zfile.Name)
+
+	if err = os.MkdirAll(filepath.Dir(fpath), os.ModePerm); err != nil {
+		return err
+	}
+
+	rc, err := zfile.Open()
+	if err != nil {
+		return err
+	}
+	defer rc.Close()
+
+	if zfile.Mode()&os.ModeSymlink != 0 {
+		oldname, err := io.ReadAll(rc)
+		if err != nil {
+			return err
+		}
+		return syscall.Symlink(string(oldname), fpath)
+	}
+
+	outFile, err := os.OpenFile(fpath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, zfile.Mode())
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if closeErr := outFile.Close(); err == nil {
+			err = closeErr
+		}
+	}()
+
+	_, err = io.Copy(outFile, rc)
+	return err
 }

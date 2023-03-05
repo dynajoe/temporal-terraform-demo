@@ -7,29 +7,31 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"os"
 	"os/exec"
-	"path"
-	"text/template"
-
-	"github.com/aws/aws-sdk-go-v2/aws"
 )
 
 type (
 	InitParams struct {
-		Backend S3BackendConfig
+		Env map[string]string
 	}
 
 	ImportParams struct {
-		Vars    map[string]interface{}
-		Env     map[string]string
-		Address string
-		ID      string
+		VarsFile string
+		Env      map[string]string
+		Address  string
+		ID       string
+	}
+
+	PlanParams struct {
+		PlanFile string
+		VarsFile string
+		Env      map[string]string
 	}
 
 	ApplyParams struct {
-		Vars map[string]interface{}
-		Env  map[string]string
+		PlanFile string
+		VarsFile string
+		Env      map[string]string
 	}
 
 	OutputParams struct {
@@ -37,30 +39,13 @@ type (
 	}
 
 	DestroyParams struct {
-		Vars map[string]interface{}
-		Env  map[string]string
+		PlanFile string
+		Env      map[string]string
 	}
 
 	Output struct {
 		Value     interface{}
 		Sensitive bool
-	}
-
-	S3BackendConfig struct {
-		Bucket      string
-		Key         string
-		Region      string
-		Env         map[string]string
-		Credentials aws.CredentialsProvider
-	}
-
-	s3BackendConfigTemplateVars struct {
-		Bucket    string
-		Key       string
-		Region    string
-		AccessKey string
-		SecretKey string
-		Token     string
 	}
 
 	NewTerraformFunc func(workDir string) (*Terraform, error)
@@ -70,20 +55,6 @@ type (
 		workDir string
 	}
 )
-
-var backendConfigTemplate = template.Must(template.New("terraform backend config").Parse(`
-terraform {
-	backend "s3" {
-      encrypt    = true
-	  bucket     = "{{ .Bucket }}"
-	  key        = "{{ .Key }}"
-	  region     = "{{ .Region }}"
-	  access_key = "{{ .AccessKey }}"
-	  secret_key = "{{ .SecretKey }}"
-	  token      = "{{ .Token }}"
-	}
-}
-`))
 
 func LazyFromPath() NewTerraformFunc {
 	var resolvedPath string
@@ -102,65 +73,98 @@ func LazyFromPath() NewTerraformFunc {
 	}
 }
 
+func (t *Terraform) Path() string {
+	return t.tfPath
+}
+
+func (t *Terraform) WorkDir() string {
+	return t.workDir
+}
+
 func (t *Terraform) Init(ctx context.Context, params InitParams) error {
-	creds, err := params.Backend.Credentials.Retrieve(ctx)
-	if err != nil {
+	execParams := t.terraformParams([]string{"init", "-no-color"}, params.Env)
+	if _, err := terraformExec(ctx, execParams); err != nil {
 		return err
 	}
-
-	// Ensure backend is configured for s3
-	configBuf := bytes.Buffer{}
-	if err := backendConfigTemplate.Execute(&configBuf, s3BackendConfigTemplateVars{
-		Bucket:    params.Backend.Bucket,
-		Key:       params.Backend.Key,
-		Region:    params.Backend.Region,
-		AccessKey: creds.AccessKeyID,
-		SecretKey: creds.SecretAccessKey,
-		Token:     creds.SessionToken,
-	}); err != nil {
-		return fmt.Errorf("error creating backend config: %w", err)
-	}
-
-	if err := os.WriteFile(path.Join(t.workDir, "_backend.tf"), configBuf.Bytes(), os.ModePerm); err != nil {
-		return err
-	}
-
-	execParams := t.terraformParams([]string{"init", "-no-color"}, params.Backend.Env)
-	if err := terraformExec(ctx, execParams); err != nil {
-		return err
-	}
-
 	return nil
 }
 
 func (t *Terraform) Import(ctx context.Context, params ImportParams) error {
-	args, err := t.withVars(params.Vars, []string{"import", "-no-color", "-input=false"})
-	if err != nil {
-		return err
+	args := []string{
+		"import",
+		"-no-color",
+		"-input=false",
+		"-var-file=" + params.VarsFile,
 	}
 
 	execParams := t.terraformParams(append(args, params.Address, params.ID), params.Env)
-	return terraformExec(ctx, execParams)
+	if _, err := terraformExec(ctx, execParams); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (t *Terraform) Plan(ctx context.Context, params PlanParams) (bool, error) {
+	args := []string{
+		"plan",
+		"-no-color",
+		"-detailed-exitcode",
+		"-input=false",
+		"-out=" + params.PlanFile,
+		"-var-file=" + params.VarsFile,
+	}
+
+	execParams := t.terraformParams(args, params.Env)
+	execParams.detailedExitCode = true
+	exitCode, err := terraformExec(ctx, execParams)
+	if err != nil {
+		return false, err
+	}
+
+	// 0 - Succeeded, diff is empty (no changes)
+	// 1 - Errored
+	// 2 - Succeeded, there is a diff
+	switch exitCode {
+	case 0:
+		return false, nil // The diff is empty
+	case 2:
+		return true, nil // There's a diff
+	default:
+		return false, fmt.Errorf("terraform plan unexpected exit code: %d", exitCode)
+	}
 }
 
 func (t *Terraform) Apply(ctx context.Context, params ApplyParams) error {
-	args, err := t.withVars(params.Vars, []string{"apply", "-auto-approve", "-no-color", "-input=false"})
-	if err != nil {
-		return err
+	args := []string{
+		"apply",
+		"-auto-approve",
+		"-no-color",
+		"-input=false",
+		"-var-file=" + params.VarsFile,
+		params.PlanFile,
 	}
 
 	execParams := t.terraformParams(args, params.Env)
-	return terraformExec(ctx, execParams)
+	if _, err := terraformExec(ctx, execParams); err != nil {
+		return err
+	}
+	return nil
 }
 
 func (t *Terraform) Destroy(ctx context.Context, params DestroyParams) error {
-	args, err := t.withVars(params.Vars, []string{"destroy", "-auto-approve", "-no-color", "-input=false"})
-	if err != nil {
-		return err
+	args := []string{
+		"destroy",
+		"-auto-approve",
+		"-no-color",
+		"-input=false",
+		params.PlanFile,
 	}
 
 	execParams := t.terraformParams(args, params.Env)
-	return terraformExec(ctx, execParams)
+	if _, err := terraformExec(ctx, execParams); err != nil {
+		return err
+	}
+	return nil
 }
 
 func (t *Terraform) Output(ctx context.Context, params OutputParams) (map[string]Output, error) {
@@ -170,7 +174,7 @@ func (t *Terraform) Output(ctx context.Context, params OutputParams) (map[string
 	output := bytes.Buffer{}
 	execParams := t.terraformParams(args, params.Env)
 	execParams.stdOut = io.MultiWriter(&output, execParams.stdOut)
-	if err := terraformExec(ctx, execParams); err != nil {
+	if _, err := terraformExec(ctx, execParams); err != nil {
 		return nil, err
 	}
 
@@ -203,23 +207,6 @@ func (t *Terraform) terraformParams(args []string, env map[string]string) terraf
 		stdErr:  log.Writer(),
 		stdOut:  log.Writer(),
 	}
-}
-
-func (t *Terraform) withVars(vars map[string]interface{}, args []string) ([]string, error) {
-	if len(vars) > 0 {
-		varsJson, err := json.Marshal(vars)
-		if err != nil {
-			return nil, err
-		}
-
-		varFilePath := path.Join(t.workDir, "terraform.tfvars.json")
-		if err := os.WriteFile(varFilePath, varsJson, os.ModePerm); err != nil {
-			return nil, err
-		}
-
-		args = append(args, "-var-file="+varFilePath)
-	}
-	return args, nil
 }
 
 func parseJson(message json.RawMessage) interface{} {
