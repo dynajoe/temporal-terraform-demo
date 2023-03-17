@@ -13,12 +13,13 @@ import (
 )
 
 type terraformExecParams struct {
-	tfPath  string
-	args    []string
-	env     map[string]string
-	stdErr  io.Writer
-	stdOut  io.Writer
-	workDir string
+	tfPath           string
+	args             []string
+	env              map[string]string
+	stdErr           io.Writer
+	stdOut           io.Writer
+	workDir          string
+	detailedExitCode bool
 }
 
 type terraformErrorInterceptor struct {
@@ -36,7 +37,7 @@ func (t *terraformErrorInterceptor) Write(p []byte) (n int, err error) {
 	return len(p), nil
 }
 
-func terraformExec(ctx context.Context, run terraformExecParams) error {
+func terraformExec(ctx context.Context, run terraformExecParams) (int, error) {
 	exited := false
 	defer func() {
 		exited = true
@@ -59,12 +60,12 @@ func terraformExec(ctx context.Context, run terraformExecParams) error {
 
 	// Check context before starting
 	if ctx.Err() != nil {
-		return ctx.Err()
+		return -1, ctx.Err()
 	}
 
 	// Run the command
 	if err := cmd.Start(); err != nil {
-		return fmt.Errorf("terraform start command error: %s\n%w", strings.Join(errorInterceptor.errors, "\n"), err)
+		return -1, fmt.Errorf("terraform start command error: %s\n%w", strings.Join(errorInterceptor.errors, "\n"), err)
 	}
 
 	ctx, cancel := context.WithCancel(ctx)
@@ -108,7 +109,11 @@ func terraformExec(ctx context.Context, run terraformExecParams) error {
 	}()
 
 	if err := cmd.Wait(); err != nil {
-		return fmt.Errorf("terraform error: %s\n%w", strings.Join(errorInterceptor.errors, "\n"), err)
+		exitCode := cmd.ProcessState.ExitCode()
+		if run.detailedExitCode && (exitCode == 2 || exitCode == 0) {
+			return exitCode, nil
+		}
+		return exitCode, fmt.Errorf("terraform error: %s\n%w", strings.Join(errorInterceptor.errors, "\n"), err)
 	}
-	return nil
+	return cmd.ProcessState.ExitCode(), nil
 }

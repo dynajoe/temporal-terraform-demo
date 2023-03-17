@@ -2,6 +2,7 @@ package main
 
 import (
 	"log"
+	"os"
 	"time"
 
 	"go.temporal.io/sdk/client"
@@ -13,7 +14,7 @@ import (
 func main() {
 	serviceClient, err := client.NewClient(client.Options{
 		Namespace: "default",
-		HostPort:  "127.0.0.1:7233",
+		HostPort:  os.Getenv("TEMPORAL_TF_DEMO_ADDR"),
 	})
 	if err != nil {
 		log.Fatal(err.Error())
