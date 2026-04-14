@@ -43,6 +43,22 @@ type (
 		StateKey      string
 	}
 
+	DestroyTerraformInput struct {
+		TerraformPath string
+		Env           map[string]string
+		StateKey      string
+	}
+
+	BundleEmbeddedTerraformDestroyInput struct {
+		TerraformPath string
+		StateKey      string
+	}
+
+	DestroyPlanInput struct {
+		BundlePath string
+		Env        map[string]string
+	}
+
 	ApplyDecision string
 )
 
@@ -154,6 +170,101 @@ func TerraformApplyActivity(ctx context.Context, input ApplyInput) (tfworkspace.
 	}
 
 	return tfworkspace.NewFromBundle(input.BundlePath).Apply(ctx, env, input.PlanFile)
+}
+
+func TerraformPlanAndDestroyWorkflow(ctx workflow.Context, input DestroyTerraformInput) error {
+	ctx = workflow.WithActivityOptions(ctx, workflow.ActivityOptions{
+		StartToCloseTimeout: time.Hour,
+		HeartbeatTimeout:    time.Minute,
+		RetryPolicy: &temporal.RetryPolicy{
+			InitialInterval:    5 * time.Second,
+			BackoffCoefficient: 1.3,
+			MaximumInterval:    10 * time.Second,
+		},
+	})
+
+	// Bundle a minimal snapshot of terraform configuration (versions.tf + backend) for destroy
+	var bundlePath string
+	if err := workflow.ExecuteActivity(ctx, TerraformBundleEmbeddedTerraformDestroyActivity, BundleEmbeddedTerraformDestroyInput{
+		TerraformPath: input.TerraformPath,
+		StateKey:      input.StateKey,
+	}).Get(ctx, &bundlePath); err != nil {
+		return err
+	}
+
+	for {
+		// terraform plan -destroy
+		planOutput := tfworkspace.PlanOutput{}
+		if err := workflow.ExecuteActivity(ctx, TerraformDestroyPlanActivity, DestroyPlanInput{
+			BundlePath: bundlePath,
+			Env:        input.Env,
+		}).Get(ctx, &planOutput); err != nil {
+			return err
+		}
+
+		// nothing to destroy
+		if !planOutput.HasChanges {
+			return nil
+		}
+
+		// prompt for user to approve, plan, or reject
+		var decision string
+		workflow.GetSignalChannel(ctx, "terraform-destroy-signal").Receive(ctx, &decision)
+
+		// plan again
+		if decision == "plan" {
+			continue
+		}
+
+		if decision == "reject" {
+			return nil
+		}
+
+		if decision == "approve" {
+			// terraform apply (the destroy plan)
+			if err := workflow.ExecuteActivity(ctx, TerraformApplyActivity, ApplyInput{
+				PlanFile:   planOutput.PlanFile,
+				BundlePath: bundlePath,
+				Env:        input.Env,
+			}).Get(ctx, nil); err != nil {
+				return err
+			}
+			return nil
+		}
+	}
+}
+
+func TerraformBundleEmbeddedTerraformDestroyActivity(ctx context.Context, input BundleEmbeddedTerraformDestroyInput) (string, error) {
+	activityInfo := activity.GetInfo(ctx)
+	return tfworkspace.NewBundleBuilder().
+		Source(terraform.FS, input.TerraformPath).
+		WithS3Backend(tfworkspace.S3BackendConfig{
+			Bucket:        "temporal-joe-terraform-demo-state",
+			Key:           input.StateKey,
+			Region:        "us-west-2",
+			AssumeRoleArn: "",
+			Profile:       "",
+		}).
+		WithMetadata(map[string]string{
+			"workflowType": activityInfo.WorkflowType.Name,
+			"workflowID":   activityInfo.WorkflowExecution.ID,
+			"runID":        activityInfo.WorkflowExecution.RunID,
+			"activityID":   activityInfo.ActivityID,
+			"activityType": activityInfo.ActivityType.Name,
+		}).
+		BundleForDestroy()
+}
+
+func TerraformDestroyPlanActivity(ctx context.Context, input DestroyPlanInput) (tfworkspace.PlanOutput, error) {
+	ctx, cancel := heartbeat.Begin(ctx, 10*time.Second)
+	defer cancel()
+
+	env, err := terraformEnv(ctx, input.Env)
+	if err != nil {
+		return tfworkspace.PlanOutput{}, err
+	}
+
+	return tfworkspace.NewFromBundle(input.BundlePath).PlanDestroy(ctx, env)
 }
 
 func terraformEnv(ctx context.Context, mergeEnv map[string]string) (map[string]string, error) {

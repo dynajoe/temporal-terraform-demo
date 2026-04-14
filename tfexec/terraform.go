@@ -26,6 +26,7 @@ type (
 		PlanFile string
 		VarsFile string
 		Env      map[string]string
+		Destroy  bool
 	}
 
 	ApplyParams struct {
@@ -39,7 +40,7 @@ type (
 	}
 
 	DestroyParams struct {
-		PlanFile string
+		VarsFile string
 		Env      map[string]string
 	}
 
@@ -111,7 +112,12 @@ func (t *Terraform) Plan(ctx context.Context, params PlanParams) (bool, error) {
 		"-detailed-exitcode",
 		"-input=false",
 		"-out=" + params.PlanFile,
-		"-var-file=" + params.VarsFile,
+	}
+	if params.VarsFile != "" {
+		args = append(args, "-var-file="+params.VarsFile)
+	}
+	if params.Destroy {
+		args = append(args, "-destroy")
 	}
 
 	execParams := t.terraformParams(args, params.Env)
@@ -140,8 +146,13 @@ func (t *Terraform) Apply(ctx context.Context, params ApplyParams) error {
 		"-auto-approve",
 		"-no-color",
 		"-input=false",
-		"-var-file=" + params.VarsFile,
-		params.PlanFile,
+	}
+	// Terraform rejects -var-file when applying a saved plan
+	if params.PlanFile == "" && params.VarsFile != "" {
+		args = append(args, "-var-file="+params.VarsFile)
+	}
+	if params.PlanFile != "" {
+		args = append(args, params.PlanFile)
 	}
 
 	execParams := t.terraformParams(args, params.Env)
@@ -157,7 +168,9 @@ func (t *Terraform) Destroy(ctx context.Context, params DestroyParams) error {
 		"-auto-approve",
 		"-no-color",
 		"-input=false",
-		params.PlanFile,
+	}
+	if params.VarsFile != "" {
+		args = append(args, "-var-file="+params.VarsFile)
 	}
 
 	execParams := t.terraformParams(args, params.Env)

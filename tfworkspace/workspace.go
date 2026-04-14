@@ -107,7 +107,37 @@ func (w *Workspace) Plan(ctx context.Context, env map[string]string) (PlanOutput
 	}, nil
 }
 
-func (w *Workspace) Destroy(ctx context.Context, env map[string]string, planFile string) error {
+func (w *Workspace) PlanDestroy(ctx context.Context, env map[string]string) (PlanOutput, error) {
+	// Init workspace
+	tf, cleanup, err := w.init(ctx)
+	if err != nil {
+		return PlanOutput{}, err
+	}
+	defer cleanup()
+
+	// Temporary file to write destroy plan
+	planFile, err := os.CreateTemp("", "terraform.*.tf-destroy-plan")
+	if err != nil {
+		return PlanOutput{}, err
+	}
+
+	// Terraform plan -destroy
+	hasChanges, err := tf.Plan(ctx, tfexec.PlanParams{
+		Env:      env,
+		PlanFile: planFile.Name(),
+		Destroy:  true,
+	})
+	if err != nil {
+		return PlanOutput{}, fmt.Errorf("terraform plan destroy error: %w", err)
+	}
+
+	return PlanOutput{
+		PlanFile:   planFile.Name(),
+		HasChanges: hasChanges,
+	}, nil
+}
+
+func (w *Workspace) Destroy(ctx context.Context, env map[string]string) error {
 	// Init workspace
 	tf, cleanup, err := w.init(ctx)
 	if err != nil {
@@ -116,8 +146,7 @@ func (w *Workspace) Destroy(ctx context.Context, env map[string]string, planFile
 	defer cleanup()
 
 	if err := tf.Destroy(ctx, tfexec.DestroyParams{
-		PlanFile: planFile,
-		Env:      env,
+		Env: env,
 	}); err != nil {
 		return fmt.Errorf("terraform destroy error: %w", err)
 	}
